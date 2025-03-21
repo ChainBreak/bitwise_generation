@@ -6,3 +6,4 @@ scikit-learn
 matplotlib
 torchvision
 opencv-python
+tensorboard

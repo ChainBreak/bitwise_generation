@@ -1,12 +1,18 @@
 import lightning as L
+from lightning.pytorch import loggers 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 def main():
-    learning_rate = 0.001
+    learning_rate = 0.0001
     model = SimpleLightningModule(learning_rate)
-    trainer = L.Trainer(max_epochs=10)
+    trainer = L.Trainer(
+        max_epochs=100,
+        accelerator="mps",
+        logger=loggers.TensorBoardLogger("lightning_logs", name="bit_wise"),
+        
+        )
     trainer.fit(model)
 
 class SimpleLightningModule(L.LightningModule):
@@ -14,30 +20,68 @@ class SimpleLightningModule(L.LightningModule):
         super(SimpleLightningModule, self).__init__()
         self.save_hyperparameters()
         self.model = SimpleModel()
-        self.loss_fn = nn.MSELoss()
+        self.loss_fn = nn.BCELoss()
         self.learning_rate = learning_rate
 
+  
     def forward(self, x):
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
         x = batch[0]
-        y_hat = self(x)
-        loss = self.loss_fn(y_hat, x)
+
+        t = self.sample_t_for_each_sample_in_batch(x.shape)
+        mask = self.sample_random_mask(t, x.shape)
+
+        # {0,1} -> {-1,1}
+        x_tri = x * 2 -1
+
+        # Maksed bits become zero {-1,0,1}
+        x_tri_masked = x_tri * mask
+        # print(f"{t[0]=}\n{mask[0]=}\n{x_tri[0]=}\n{x_tri_masked[0]=}")
+       
+        x_hat = self(x_tri_masked)
+        loss = self.loss_fn(x_hat, x)
         self.log('train_loss', loss)
         return loss
+    
+    
+    def sample_t_for_each_sample_in_batch(self, shape: torch.Size) -> torch.Tensor:
+        t = torch.rand(shape[0], device=self.device)
+        return t
+    
+    def sample_random_mask(self, t: torch.Tensor, shape: torch.Size) -> torch.Tensor:
+        if not t.shape[0] == shape[0]:
+            raise ValueError(f"Expected first dimension of t to be {shape[0]}, but got {t.shape[0]}")
+        
+        # Make sure t has the same number of dimensions as shape
+        while t.dim() < len(shape):
+            t = t.unsqueeze(-1)
+        
+        # Make binary mask with probability t
+        # Each sample in the batchs gets its own mask
+        mask = torch.rand(shape, device=self.device) > t
+
+        return mask
 
     def train_dataloader(self):
+        dataset_size = 10000
 
         # Generate normal random integers between 0 and 255 centered at 128
-        x_int = torch.normal(128, 64, size=(10,)).clamp(0, 255).int()
+        x_int = torch.normal(128, 64, size=(dataset_size,)).clamp(0, 255).int()
 
         x_bit_strings = [f'{i:08b}' for i in x_int]
 
         x_bits = torch.tensor([list(map(float, i)) for i in x_bit_strings], dtype=torch.float32)
 
         dataset = TensorDataset(x_bits)
-        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+        dataloader = DataLoader(
+            dataset=dataset, 
+            batch_size=32, 
+            shuffle=True,
+            num_workers=0,
+        )
+
         return dataloader
 
     def configure_optimizers(self):
@@ -48,14 +92,18 @@ class SimpleLightningModule(L.LightningModule):
 class SimpleModel(nn.Module):
     def __init__(self, input_dim=8, hidden_dim=100, output_dim=8):
         super(SimpleModel, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.sequence = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+            nn.Sigmoid()
+        )
+
 
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
+        x = self.sequence(x)
         return x
 
 
