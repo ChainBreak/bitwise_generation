@@ -21,16 +21,22 @@ class SimpleLightningModule(L.LightningModule):
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
-        x, y = batch
+        x = batch[0]
         y_hat = self(x)
-        loss = self.loss_fn(y_hat, y)
+        loss = self.loss_fn(y_hat, x)
         self.log('train_loss', loss)
         return loss
 
     def train_dataloader(self):
-        x = torch.randn(100, 8)
-        y = torch.randn(100, 8)
-        dataset = TensorDataset(x, y)
+
+        # Generate normal random integers between 0 and 255 centered at 128
+        x_int = torch.normal(128, 64, size=(10,)).clamp(0, 255).int()
+
+        x_bit_strings = [f'{i:08b}' for i in x_int]
+
+        x_bits = torch.tensor([list(map(float, i)) for i in x_bit_strings], dtype=torch.float32)
+
+        dataset = TensorDataset(x_bits)
         dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
         return dataloader
 
