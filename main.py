@@ -43,8 +43,25 @@ class SimpleLightningModule(L.LightningModule):
         x_hat = self(x_tri_masked)
         loss = self.loss_fn(x_hat, x)
         self.log('train_loss', loss)
+        if batch_idx % 100 == 0:
+            samples = self.generate_samples(1, 10)
+            
         return loss
     
+    def generate_samples(self, num_samples, num_steps):
+        x = torch.zeros(num_samples, 8,device=self.device)
+
+        for t,i in enumerate(torch.linspace(1, 0, num_steps)):
+            t = torch.tensor([i],dtype=torch.float32)
+            t = t.repeat(num_samples).to(self.device)
+            mask = self.sample_random_mask(t, x.shape)
+            x_tri = x * 2 -1
+            x_tri_masked = x_tri * mask
+            x_prob = self(x_tri_masked)
+            x = x_prob > torch.rand_like(x_prob)
+            x = x.float()
+            print(f"{i:03}",x[0])
+        return x
     
     def sample_t_for_each_sample_in_batch(self, shape: torch.Size) -> torch.Tensor:
         t = torch.rand(shape[0], device=self.device)
