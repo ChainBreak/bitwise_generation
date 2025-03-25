@@ -2,16 +2,18 @@ import lightning as L
 from lightning.pytorch import loggers 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 
 def main():
 
     model = SimpleLightningModule(
-        learning_rate=0.0001,
+        learning_rate=0.001,
         denoise_steps=100,
-        batch_size=128,
+        batch_size=512,
         )
+
     trainer = L.Trainer(
         max_epochs=100,
         accelerator="mps",
@@ -46,14 +48,14 @@ class SimpleLightningModule(L.LightningModule):
         mask = self.sample_random_mask(t, x.shape)
 
         x_hat = self(x, mask)
+        inv_mask = 1 - mask
 
-        loss = self.loss_fn(x_hat, x)
+        # Only compute loss where the mask was 0
+        loss = self.loss_fn(inv_mask * x_hat, inv_mask * x)
+
+
         self.log('train_loss', loss)
-
-
-        # if batch_idx % 100 == 0:
-        #     samples = self.generate_samples(1, 10)
-            
+           
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -65,6 +67,7 @@ class SimpleLightningModule(L.LightningModule):
         x_real_int = self.bits_to_int(x_real)
 
         self.validation_outputs.append((x_pred_int, x_real_int))
+
 
     def on_validation_epoch_end(self):
         x_pred_int = torch.cat([o[0] for o in self.validation_outputs])
@@ -84,12 +87,9 @@ class SimpleLightningModule(L.LightningModule):
         plt.close()
 
 
-
-
     def bits_to_int(self, x):
         exponents = torch.arange(start=7,end=-1,step=-1, device=x.device)
         return torch.sum(x * (2 ** exponents), dim=1).int()
-
 
 
     def generate_samples(self, num_samples, num_steps):
@@ -113,11 +113,6 @@ class SimpleLightningModule(L.LightningModule):
                 # Update the masked bits
                 x = mask * x + (1 - mask) * x_sampled
 
-                # print(f"{t[0].item():3.1f} mask",mask[0])
-                # print(f"{t[0].item():3.1f} xtri",x_tri[0])
-
-                # Print masked ternary values with consistent spacing
-                # print(f"masked: {' '.join(f'{v:>3.0f}' for v in x[0])}")
         return x
     
     def binary_to_ternery(self, x):
@@ -147,7 +142,11 @@ class SimpleLightningModule(L.LightningModule):
         dataset_size = 50000
 
         # Generate normal random integers between 0 and 255 centered at 128
-        x_int = torch.normal(128, 32, size=(dataset_size,)).clamp(0, 255).int()
+        x_int = torch.cat([
+            torch.normal(70, 20, size=(int(dataset_size*0.75),)).clamp(0, 255).int(),
+            torch.normal(150, 32, size=(int(dataset_size*0.25),)).clamp(0, 255).int(),
+  
+        ])
 
         x_bit_strings = [f'{i:08b}' for i in x_int]
 
@@ -172,13 +171,15 @@ class SimpleLightningModule(L.LightningModule):
     
 
 class SimpleModel(nn.Module):
-    def __init__(self, input_dim=8, hidden_dim=100, output_dim=8):
+    def __init__(self, input_dim=8, hidden_dim=256, output_dim=8):
         super(SimpleModel, self).__init__()
         self.sequence = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
             nn.Linear(hidden_dim, output_dim),
             nn.Sigmoid()
         )
