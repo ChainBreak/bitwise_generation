@@ -1,5 +1,6 @@
 import lightning as L
 from lightning.pytorch import loggers 
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -9,13 +10,13 @@ import matplotlib.pyplot as plt
 def main():
 
     model = SimpleLightningModule(
-        learning_rate=0.001,
+        learning_rate=0.00001,
         denoise_steps=100,
         batch_size=512,
         )
 
     trainer = L.Trainer(
-        max_epochs=100,
+        max_epochs=200,
         accelerator="mps",
         logger=loggers.TensorBoardLogger("lightning_logs", name="bit_wise"),
         check_val_every_n_epoch=10,
@@ -53,7 +54,6 @@ class SimpleLightningModule(L.LightningModule):
         # Only compute loss where the mask was 0
         loss = self.loss_fn(inv_mask * x_hat, inv_mask * x)
 
-
         self.log('train_loss', loss)
            
         return loss
@@ -74,11 +74,18 @@ class SimpleLightningModule(L.LightningModule):
         x_real_int = torch.cat([o[1] for o in self.validation_outputs])
         self.validation_outputs.clear()
 
+        x_int = np.arange(0, 256)
+        x_bits = self.int_to_bits(x_int).to(self.device)
+        mask = torch.ones_like(x_bits)
+
+        x_bit_prob = 1.0 - (x_bits - self(x_bits, mask)).abs()
+        x_int_prob = torch.prod(x_bit_prob, dim=1)
 
         # Create histogram of predicted and real values
         plt.figure(figsize=(5, 4))
         plt.hist(x_pred_int.cpu().numpy(), bins=64, alpha=0.5, label='Predicted', density=True)
         plt.hist(x_real_int.cpu().numpy(), bins=64, alpha=0.5, label='Real', density=True)
+        plt.plot(x_int, x_int_prob.cpu().numpy(), label='Ideal', color='black')
         plt.xlabel('Value')
         plt.ylabel('Density')
         plt.title('Distribution of Predicted vs Real Values')
@@ -87,9 +94,6 @@ class SimpleLightningModule(L.LightningModule):
         plt.close()
 
 
-    def bits_to_int(self, x):
-        exponents = torch.arange(start=7,end=-1,step=-1, device=x.device)
-        return torch.sum(x * (2 ** exponents), dim=1).int()
 
 
     def generate_samples(self, num_samples, num_steps):
@@ -148,9 +152,7 @@ class SimpleLightningModule(L.LightningModule):
   
         ])
 
-        x_bit_strings = [f'{i:08b}' for i in x_int]
-
-        x_bits = torch.tensor([list(map(float, i)) for i in x_bit_strings], dtype=torch.float32)
+        x_bits = self.int_to_bits(x_int)
 
         dataset = TensorDataset(x_bits)
         dataloader = DataLoader(
@@ -161,6 +163,15 @@ class SimpleLightningModule(L.LightningModule):
         )
 
         return dataloader
+    
+    def int_to_bits(self, x_int):
+        x_bit_strings = [f'{i:08b}' for i in x_int]
+        x_bits = torch.tensor([list(map(float, i)) for i in x_bit_strings], dtype=torch.float32)
+        return x_bits
+    
+    def bits_to_int(self, x_bits):
+        exponents = torch.arange(start=7,end=-1,step=-1, device=x_bits.device)
+        return torch.sum(x_bits * (2 ** exponents), dim=1).int()
 
     def val_dataloader(self):
         return self.train_dataloader()
