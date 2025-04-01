@@ -9,23 +9,25 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import ssl
 from monai.networks.nets import UNet
+import time
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
 def main():
 
     model = SimpleLightningModule(
-        learning_rate=0.00001,
-        denoise_steps=100,
-        batch_size=32,
+        learning_rate=0.0001,
+        denoise_steps=1000,
+        batch_size=128,
         image_size=64,
+        num_bits=8,
+        log_interval_seconds=60,
         )
 
     trainer = L.Trainer(
-        max_epochs=200,
+        max_epochs=9999,
         accelerator="mps",
         logger=loggers.TensorBoardLogger("lightning_logs", name="bit_wise"),
-        check_val_every_n_epoch=10,
     )
     trainer.fit(model)
 
@@ -38,13 +40,13 @@ class SimpleLightningModule(L.LightningModule):
             spatial_dims=2,
             in_channels=24,  # Input is 3 * 8 bits
             out_channels=24,  # Output is 3 * 8 bits
-            channels=(16, 32, 64, 128),  # Feature channels at each layer
+            channels=(32, 64, 128, 256),  # Feature channels at each layer
             strides=(2, 2, 2),  # Downsampling factors
             num_res_units=2,  # Number of residual units per layer
         )
         self.loss_fn = nn.BCELoss()
 
-        self.validation_outputs = []
+        self.last_sample_time = time.time()  # Initialize with current time
 
   
     def forward(self, x, mask):
@@ -53,11 +55,13 @@ class SimpleLightningModule(L.LightningModule):
         # Maksed bits become zero so that the set of inputs values is {-1,0,1}
         x_tri_masked = x_tri * mask
 
-        return self.model(x_tri_masked)
+        return F.sigmoid(self.model(x_tri_masked))
 
     def training_step(self, batch, batch_idx):
+        p = self.hparams
         x_int = batch[0]
-        x_bits = self.int_to_bits(x_int, 8)
+    
+        x_bits = self.int_to_bits(x_int, p.num_bits)
 
         t = self.sample_t_for_each_sample_in_batch(x_bits.shape)
         mask = self.sample_random_mask(t, x_bits.shape)
@@ -69,49 +73,33 @@ class SimpleLightningModule(L.LightningModule):
         loss = self.loss_fn(inv_mask * x_hat, inv_mask * x_bits)
 
         self.log('train_loss', loss)
-           
+
+        self.periodically_generate_and_log_samples()
+        
         return loss
     
-    # def validation_step(self, batch, batch_idx):
-    #     x_real = batch[0]
+    def periodically_generate_and_log_samples(self):
+        p = self.hparams
+        current_time = time.time()
         
-    #     x_pred = self.generate_samples(len(x_real), self.hparams.denoise_steps)
+        # Check if a minute has passed
+        if current_time - self.last_sample_time >= p.log_interval_seconds:  # 60 seconds
+            self.last_sample_time = current_time
+            x_bits = self.generate_bit_samples(16, p.denoise_steps)
+            x_int = self.bits_to_int(x_bits, p.num_bits)
+            self.log_batch_of_samples('samples', x_int)
+            
+    def log_batch_of_samples(self,name, x_int):
+            x = x_int / 255.0
+            b = x.shape[0]
+            nrow = int(np.sqrt(b))
+            grid = torchvision.utils.make_grid(x,nrow=nrow)
+            self.logger.experiment.add_image(name, grid, self.global_step)
 
-    #     x_pred_int = self.bits_to_int(x_pred)
-    #     x_real_int = self.bits_to_int(x_real)
-
-    #     self.validation_outputs.append((x_pred_int, x_real_int))
-
-
-    def on_validation_epoch_end(self):
-        x_pred_int = torch.cat([o[0] for o in self.validation_outputs])
-        x_real_int = torch.cat([o[1] for o in self.validation_outputs])
-        self.validation_outputs.clear()
-
-        x_int = np.arange(0, 256)
-        x_bits = self.int_to_bits(x_int).to(self.device)
-        mask = torch.ones_like(x_bits)
-
-        x_bit_prob = 1.0 - (x_bits - self(x_bits, mask)).abs()
-        x_int_prob = torch.prod(x_bit_prob, dim=1)
-
-        # Create histogram of predicted and real values
-        plt.figure(figsize=(5, 4))
-        plt.hist(x_pred_int.cpu().numpy(), bins=64, alpha=0.5, label='Predicted', density=True)
-        plt.hist(x_real_int.cpu().numpy(), bins=64, alpha=0.5, label='Real', density=True)
-        plt.plot(x_int, x_int_prob.cpu().numpy(), label='Ideal', color='black')
-        plt.xlabel('Value')
-        plt.ylabel('Density')
-        plt.title('Distribution of Predicted vs Real Values')
-        plt.legend()
-        self.logger.experiment.add_figure('val_distribution', plt.gcf(), self.current_epoch)
-        plt.close()
-
-
-
-
-    def generate_samples(self, num_samples, num_steps):
-        x = torch.zeros(num_samples, 8,device=self.device)
+    def generate_bit_samples(self, num_samples, num_steps):
+        print(f"Generating {num_samples} samples at epoch {self.current_epoch}")
+        p = self.hparams
+        x = torch.zeros(num_samples, 3*p.num_bits, p.image_size, p.image_size, device=self.device)
         with torch.no_grad():
             for t in torch.linspace(1, 0, num_steps):
 
@@ -155,6 +143,7 @@ class SimpleLightningModule(L.LightningModule):
 
         return mask.float()
 
+
     def train_dataloader(self):
         p = self.hparams
         current_folder = pathlib.Path(__file__).resolve().parent
@@ -176,6 +165,7 @@ class SimpleLightningModule(L.LightningModule):
         
         return train_loader
     
+
     def transform(self, pil_image):
         p = self.hparams
         transform = torchvision.transforms.Compose([
@@ -185,6 +175,7 @@ class SimpleLightningModule(L.LightningModule):
         ])
         return transform(pil_image)
     
+
     def int_to_bits(self, x_int: torch.Tensor, num_bits: int):
         b,c,h,w = x_int.shape
         
@@ -199,7 +190,7 @@ class SimpleLightningModule(L.LightningModule):
 
         return x_bits
     
-    def bits_to_int(self, x_bits: torch.Tensor, num_bits: int, dtype: torch.dtype = torch.int8):
+    def bits_to_int(self, x_bits: torch.Tensor, num_bits: int, dtype: torch.dtype = torch.uint8):
         # Calculate the number of integer channels
         b,c_bits,h,w = x_bits.shape
         c = c_bits // num_bits
@@ -217,10 +208,6 @@ class SimpleLightningModule(L.LightningModule):
 
         return x_int
 
-   
-
-    def val_dataloader(self):
-        return self.train_dataloader()
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
