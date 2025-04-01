@@ -1,18 +1,24 @@
+import pathlib
 import lightning as L
 from lightning.pytorch import loggers 
 import numpy as np
 import torch
 from torch import nn
+import torchvision
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
+import ssl
+from monai.networks.nets import UNet
+
+ssl._create_default_https_context = ssl._create_unverified_context
 
 def main():
 
     model = SimpleLightningModule(
         learning_rate=0.00001,
         denoise_steps=100,
-        batch_size=512,
+        batch_size=32,
+        image_size=64,
         )
 
     trainer = L.Trainer(
@@ -28,7 +34,14 @@ class SimpleLightningModule(L.LightningModule):
         super(SimpleLightningModule, self).__init__()
         self.save_hyperparameters()
 
-        self.model = SimpleModel()
+        self.model = UNet(
+            spatial_dims=2,
+            in_channels=24,  # Input is 3 * 8 bits
+            out_channels=24,  # Output is 3 * 8 bits
+            channels=(16, 32, 64, 128),  # Feature channels at each layer
+            strides=(2, 2, 2),  # Downsampling factors
+            num_res_units=2,  # Number of residual units per layer
+        )
         self.loss_fn = nn.BCELoss()
 
         self.validation_outputs = []
@@ -43,30 +56,31 @@ class SimpleLightningModule(L.LightningModule):
         return self.model(x_tri_masked)
 
     def training_step(self, batch, batch_idx):
-        x = batch[0]
+        x_int = batch[0]
+        x_bits = self.int_to_bits(x_int, 8)
 
-        t = self.sample_t_for_each_sample_in_batch(x.shape)
-        mask = self.sample_random_mask(t, x.shape)
+        t = self.sample_t_for_each_sample_in_batch(x_bits.shape)
+        mask = self.sample_random_mask(t, x_bits.shape)
 
-        x_hat = self(x, mask)
+        x_hat = self(x_bits, mask)
         inv_mask = 1 - mask
 
         # Only compute loss where the mask was 0
-        loss = self.loss_fn(inv_mask * x_hat, inv_mask * x)
+        loss = self.loss_fn(inv_mask * x_hat, inv_mask * x_bits)
 
         self.log('train_loss', loss)
            
         return loss
     
-    def validation_step(self, batch, batch_idx):
-        x_real = batch[0]
+    # def validation_step(self, batch, batch_idx):
+    #     x_real = batch[0]
         
-        x_pred = self.generate_samples(len(x_real), self.hparams.denoise_steps)
+    #     x_pred = self.generate_samples(len(x_real), self.hparams.denoise_steps)
 
-        x_pred_int = self.bits_to_int(x_pred)
-        x_real_int = self.bits_to_int(x_real)
+    #     x_pred_int = self.bits_to_int(x_pred)
+    #     x_real_int = self.bits_to_int(x_real)
 
-        self.validation_outputs.append((x_pred_int, x_real_int))
+    #     self.validation_outputs.append((x_pred_int, x_real_int))
 
 
     def on_validation_epoch_end(self):
@@ -143,35 +157,67 @@ class SimpleLightningModule(L.LightningModule):
 
     def train_dataloader(self):
         p = self.hparams
-        dataset_size = 50000
+        current_folder = pathlib.Path(__file__).resolve().parent
+        data_root = current_folder / '.dataset_root'
 
-        # Generate normal random integers between 0 and 255 centered at 128
-        x_int = torch.cat([
-            torch.normal(70, 20, size=(int(dataset_size*0.75),)).clamp(0, 255).int(),
-            torch.normal(150, 32, size=(int(dataset_size*0.25),)).clamp(0, 255).int(),
-  
-        ])
-
-        x_bits = self.int_to_bits(x_int)
-
-        dataset = TensorDataset(x_bits)
-        dataloader = DataLoader(
-            dataset=dataset, 
-            batch_size=p.batch_size, 
-            shuffle=True,
-            num_workers=0,
+        # Define your training dataset and dataloader here
+        train_dataset = torchvision.datasets.Flowers102(
+            root=data_root,
+            split="train",
+            download=True, 
+            transform = self.transform,
         )
-
-        return dataloader
+        
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=p.batch_size,
+            shuffle=True,
+            )
+        
+        return train_loader
     
-    def int_to_bits(self, x_int):
-        x_bit_strings = [f'{i:08b}' for i in x_int]
-        x_bits = torch.tensor([list(map(float, i)) for i in x_bit_strings], dtype=torch.float32)
+    def transform(self, pil_image):
+        p = self.hparams
+        transform = torchvision.transforms.Compose([
+            torchvision.transforms.CenterCrop(min(pil_image.size)),
+            torchvision.transforms.Resize((p.image_size , p.image_size)),
+            torchvision.transforms.PILToTensor(),
+        ])
+        return transform(pil_image)
+    
+    def int_to_bits(self, x_int: torch.Tensor, num_bits: int):
+        b,c,h,w = x_int.shape
+        
+        # Move channels into batch dimension
+        x_int = x_int.reshape(b*c,h,w)
+        x_bits = torch.zeros(b*c,num_bits,h,w, device=x_int.device, dtype=torch.float32)
+
+        for i in range(num_bits):
+            x_bits[:,i,:,:] = (x_int >> i) & 1
+
+        x_bits = x_bits.reshape(b,c*num_bits,h,w)
+
         return x_bits
     
-    def bits_to_int(self, x_bits):
-        exponents = torch.arange(start=7,end=-1,step=-1, device=x_bits.device)
-        return torch.sum(x_bits * (2 ** exponents), dim=1).int()
+    def bits_to_int(self, x_bits: torch.Tensor, num_bits: int, dtype: torch.dtype = torch.int8):
+        # Calculate the number of integer channels
+        b,c_bits,h,w = x_bits.shape
+        c = c_bits // num_bits
+
+        # Convert float bits to boolean
+        x_bits = x_bits > 0.5
+
+        x_bits = x_bits.reshape(b*c,num_bits,h,w)
+        x_int = torch.zeros(b*c,h,w, device=x_bits.device, dtype=dtype)
+
+        for i in range(num_bits):
+            x_int += x_bits[:,i,:,:] * (2 ** i)
+
+        x_int = x_int.reshape(b,c,h,w)
+
+        return x_int
+
+   
 
     def val_dataloader(self):
         return self.train_dataloader()
@@ -180,26 +226,6 @@ class SimpleLightningModule(L.LightningModule):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
         return optimizer
     
-
-class SimpleModel(nn.Module):
-    def __init__(self, input_dim=8, hidden_dim=256, output_dim=8):
-        super(SimpleModel, self).__init__()
-        self.sequence = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, output_dim),
-            nn.Sigmoid()
-        )
-
-
-    def forward(self, x):
-        x = self.sequence(x)
-        return x
-
 
 if __name__ == "__main__":
     main()
