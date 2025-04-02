@@ -14,18 +14,23 @@ import time
 ssl._create_default_https_context = ssl._create_unverified_context
 
 def main():
-
+    # Create model with desired hyperparameters
     model = SimpleLightningModule(
         learning_rate=0.0001,
         denoise_steps=1000,
-        batch_size=128,
+        batch_size=64,
         image_size=64,
         num_bits=8,
         log_interval_seconds=60,
-        )
+    )
+    
+    # Load weights from checkpoint while keeping current hyperparameters
+    checkpoint_path = "lightning_logs/bit_wise/version_108/checkpoints/epoch=1412-step=22608.ckpt"  # Replace with your checkpoint path
+    state_dict = torch.load(checkpoint_path)["state_dict"]
+    model.load_state_dict(state_dict, strict=True)
 
     trainer = L.Trainer(
-        max_epochs=9999,
+        max_epochs=-1,
         accelerator="mps",
         logger=loggers.TensorBoardLogger("lightning_logs", name="bit_wise"),
     )
@@ -36,26 +41,33 @@ class SimpleLightningModule(L.LightningModule):
         super(SimpleLightningModule, self).__init__()
         self.save_hyperparameters()
 
-        self.model = UNet(
-            spatial_dims=2,
-            in_channels=24,  # Input is 3 * 8 bits
-            out_channels=24,  # Output is 3 * 8 bits
-            channels=(32, 64, 128, 256),  # Feature channels at each layer
-            strides=(2, 2, 2),  # Downsampling factors
-            num_res_units=2,  # Number of residual units per layer
-        )
+        self.model = self.create_model()
+
         self.loss_fn = nn.BCELoss()
 
         self.last_sample_time = time.time()  # Initialize with current time
 
-  
+    def create_model(self):
+        return nn.Sequential(
+            UNet(
+                spatial_dims=2,
+                in_channels=24,  # Input is 3 * 8 bits
+                out_channels=64,  # Output is 3 * 8 bits
+                channels=(64, 128, 256, 512),  # Feature channels at each layer
+                strides=(2, 2, 2),  # Downsampling factors
+                num_res_units=4,  # Number of residual units per layer
+            ),
+            nn.Conv2d(64, 24, kernel_size=1, stride=1, padding=0),
+            nn.Sigmoid(),
+        )
+
     def forward(self, x, mask):
         x_tri = self.binary_to_ternery(x)
 
         # Maksed bits become zero so that the set of inputs values is {-1,0,1}
         x_tri_masked = x_tri * mask
 
-        return F.sigmoid(self.model(x_tri_masked))
+        return self.model(x_tri_masked)
 
     def training_step(self, batch, batch_idx):
         p = self.hparams
