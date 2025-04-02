@@ -25,7 +25,7 @@ def main():
     )
     
     # Load weights from checkpoint while keeping current hyperparameters
-    checkpoint_path = "lightning_logs/bit_wise/version_108/checkpoints/epoch=1412-step=22608.ckpt"  # Replace with your checkpoint path
+    checkpoint_path = "lightning_logs/bit_wise/version_110/checkpoints/epoch=502-step=8048.ckpt"  # Replace with your checkpoint path
     state_dict = torch.load(checkpoint_path)["state_dict"]
     model.load_state_dict(state_dict, strict=True)
 
@@ -191,6 +191,9 @@ class SimpleLightningModule(L.LightningModule):
     def int_to_bits(self, x_int: torch.Tensor, num_bits: int):
         b,c,h,w = x_int.shape
         
+        # convert to gray encoding
+        x_int = x_int ^ (x_int >> 1)
+
         # Move channels into batch dimension
         x_int = x_int.reshape(b*c,h,w)
         x_bits = torch.zeros(b*c,num_bits,h,w, device=x_int.device, dtype=torch.float32)
@@ -217,6 +220,11 @@ class SimpleLightningModule(L.LightningModule):
             x_int += x_bits[:,i,:,:] * (2 ** i)
 
         x_int = x_int.reshape(b,c,h,w)
+
+        # convert gray encoding back to binary
+        mask = x_int.clone()
+        for i in range(1,num_bits+1):
+            x_int ^= (mask >> i)
 
         return x_int
 
