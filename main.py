@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 def main():
 
     model = SimpleLightningModule(
-        learning_rate=0.00001,
+        learning_rate=0.0001,
         denoise_steps=100,
         batch_size=512,
         )
@@ -34,29 +34,48 @@ class SimpleLightningModule(L.LightningModule):
         self.validation_outputs = []
 
   
-    def forward(self, x, mask):
-        x_tri = self.binary_to_ternery(x)
+    def forward(self, x, t):
+        t_emb = self.sinusoidal_embedding(t)
+        x = torch.cat([x, t_emb], dim=1)
+        return self.model(x)
 
-        # Maksed bits become zero so that the set of inputs values is {-1,0,1}
-        x_tri_masked = x_tri * mask
-
-        return self.model(x_tri_masked)
+    def sinusoidal_embedding(self, t):
+        t = t.reshape(-1,1)
+        e_sin = torch.sin(t * (2 ** torch.arange(0, 16, 2, device=t.device)))
+        e_cos = torch.cos(t * (2 ** torch.arange(0, 16, 2, device=t.device)))
+        return torch.cat([e_sin, e_cos], dim=1) 
 
     def training_step(self, batch, batch_idx):
         x = batch[0]
 
         t = self.sample_t_for_each_sample_in_batch(x.shape)
-        mask = self.sample_random_mask(t, x.shape)
 
-        x_hat = self(x, mask)
-        inv_mask = 1 - mask
+        noisy_x = self.sample_random_x(x, t)
 
-        # Only compute loss where the mask was 0
-        loss = self.loss_fn(inv_mask * x_hat, inv_mask * x)
+        x_hat = self(noisy_x, t)
+
+        loss = self.loss_fn(x_hat, x)
 
         self.log('train_loss', loss)
            
         return loss
+
+    def sample_random_x(self, x_prob: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+
+        
+        # Make sure t has the same number of dimensions as shape
+        while t.dim() < len(x_prob.shape):
+            t = t.unsqueeze(-1)
+        
+        # t=0 blend_prob = x_prob
+        # t=1 blend_prob = 0.5 (fully random)
+        blend_prob = (1-t)*x_prob + t*0.5
+
+        # Make binary mask with probability t
+        # Each sample in the batchs gets its own mask
+        x = torch.rand_like(blend_prob) < blend_prob
+
+        return x.float()
     
     def validation_step(self, batch, batch_idx):
         x_real = batch[0]
@@ -74,26 +93,24 @@ class SimpleLightningModule(L.LightningModule):
         x_real_int = torch.cat([o[1] for o in self.validation_outputs])
         self.validation_outputs.clear()
 
-        x_int = np.arange(0, 256)
-        x_bits = self.int_to_bits(x_int).to(self.device)
-        mask = torch.ones_like(x_bits)
+        # x_int = np.arange(0, 256)
+        # x_bits = self.int_to_bits(x_int).to(self.device)
+        # mask = torch.ones_like(x_bits)
 
-        x_bit_prob = 1.0 - (x_bits - self(x_bits, mask)).abs()
-        x_int_prob = torch.prod(x_bit_prob, dim=1)
+        # x_bit_prob = 1.0 - (x_bits - self(x_bits, mask)).abs()
+        # x_int_prob = torch.prod(x_bit_prob, dim=1)
 
         # Create histogram of predicted and real values
         plt.figure(figsize=(5, 4))
         plt.hist(x_pred_int.cpu().numpy(), bins=64, alpha=0.5, label='Predicted', density=True)
         plt.hist(x_real_int.cpu().numpy(), bins=64, alpha=0.5, label='Real', density=True)
-        plt.plot(x_int, x_int_prob.cpu().numpy(), label='Ideal', color='black')
+        # plt.plot(x_int, x_int_prob.cpu().numpy(), label='Ideal', color='black')
         plt.xlabel('Value')
         plt.ylabel('Density')
         plt.title('Distribution of Predicted vs Real Values')
         plt.legend()
         self.logger.experiment.add_figure('val_distribution', plt.gcf(), self.current_epoch)
         plt.close()
-
-
 
 
     def generate_samples(self, num_samples, num_steps):
@@ -105,17 +122,9 @@ class SimpleLightningModule(L.LightningModule):
                 t = torch.tensor([t],dtype=torch.float32)
                 t = t.repeat(num_samples).to(self.device)
 
-                # Sample a random mask for each sample in the batch
-                mask = self.sample_random_mask(t, x.shape)
+                x = self(x,t)
 
-                # Predict the probability of each bit being 1
-                x_prob = self(x, mask)
-
-                # Sample the bits from the probability distribution
-                x_sampled = (x_prob > torch.rand_like(x_prob)).float()
-
-                # Update the masked bits
-                x = mask * x + (1 - mask) * x_sampled
+                x = self.sample_random_x(x, t)
 
         return x
     
@@ -127,19 +136,7 @@ class SimpleLightningModule(L.LightningModule):
         t = torch.rand(shape[0], device=self.device)
         return t
     
-    def sample_random_mask(self, t: torch.Tensor, shape: torch.Size) -> torch.Tensor:
-        if not t.shape[0] == shape[0]:
-            raise ValueError(f"Expected first dimension of t to be {shape[0]}, but got {t.shape[0]}")
-        
-        # Make sure t has the same number of dimensions as shape
-        while t.dim() < len(shape):
-            t = t.unsqueeze(-1)
-        
-        # Make binary mask with probability t
-        # Each sample in the batchs gets its own mask
-        mask = torch.rand(shape, device=self.device) > t
 
-        return mask.float()
 
     def train_dataloader(self):
         p = self.hparams
@@ -182,7 +179,7 @@ class SimpleLightningModule(L.LightningModule):
     
 
 class SimpleModel(nn.Module):
-    def __init__(self, input_dim=8, hidden_dim=256, output_dim=8):
+    def __init__(self, input_dim=24, hidden_dim=256, output_dim=8):
         super(SimpleModel, self).__init__()
         self.sequence = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
