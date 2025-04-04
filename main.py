@@ -17,7 +17,7 @@ def main():
     # Create model with desired hyperparameters
     model = SimpleLightningModule(
         learning_rate=0.0001,
-        denoise_steps=1000,
+        denoise_steps=100,
         batch_size=64,
         image_size=64,
         num_bits=8,
@@ -25,9 +25,9 @@ def main():
     )
     
     # Load weights from checkpoint while keeping current hyperparameters
-    checkpoint_path = "lightning_logs/bit_wise/version_110/checkpoints/epoch=502-step=8048.ckpt"  # Replace with your checkpoint path
+    checkpoint_path = "lightning_logs/bit_wise/version_113/checkpoints/epoch=1775-step=28416.ckpt"  # Replace with your checkpoint path
     state_dict = torch.load(checkpoint_path)["state_dict"]
-    model.load_state_dict(state_dict, strict=True)
+    # model.load_state_dict(state_dict, strict=True)
 
     trainer = L.Trainer(
         max_epochs=-1,
@@ -112,6 +112,9 @@ class SimpleLightningModule(L.LightningModule):
         print(f"Generating {num_samples} samples at epoch {self.current_epoch}")
         p = self.hparams
         x = torch.zeros(num_samples, 3*p.num_bits, p.image_size, p.image_size, device=self.device)
+
+        x_steps = []
+
         with torch.no_grad():
             for t in torch.linspace(1, 0, num_steps):
 
@@ -130,6 +133,13 @@ class SimpleLightningModule(L.LightningModule):
 
                 # Update the masked bits
                 x = mask * x + (1 - mask) * x_sampled
+
+                x_int = self.bits_to_int(x, p.num_bits)
+                x_steps.append(x_int[0])
+
+        x_steps = torch.stack(x_steps, dim=0)
+        self.log_batch_of_samples('x_steps', x_steps)
+
 
         return x
     
