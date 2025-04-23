@@ -45,7 +45,7 @@ class SimpleLightningModule(L.LightningModule):
 
         self.loss_fn = nn.BCELoss()
 
-        self.last_sample_time = time.time()  # Initialize with current time
+        self.last_sample_time = 0.0  # Initialize with current time
 
     def create_model(self) -> diffusers.UNet2DModel:
 
@@ -126,15 +126,23 @@ class SimpleLightningModule(L.LightningModule):
         x_steps = []
 
         with torch.no_grad():
-            for t in torch.linspace(1, 0, num_steps):
+            for t in torch.linspace(1, -0.05, num_steps):
 
+                # clamp t to 0.0 for the last few steps
+                t = max(t, 0.0)
+      
                 # Repeat t for each sample in the batch
                 t = torch.tensor([t],dtype=torch.float32)
                 t = t.repeat(num_samples).to(self.device)
 
-                x = self(x,t)
+                x_prob = self(x,t)
 
-                x = self.sample_random_x(x, t)
+                x_greedy = x_prob > 0.5
+
+                t = t.reshape(-1,1,1,1)
+                x_prob_greedy_blended = t*x_prob + (1-t)*x_greedy
+
+                x = self.sample_random_x(x_prob_greedy_blended, t)
 
                 x_int = self.bits_to_int(x, p.num_bits)
                 x_steps.append(x_int[0])
