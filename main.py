@@ -10,12 +10,17 @@ import matplotlib.pyplot as plt
 import ssl
 from monai.networks.nets import UNet
 import time
+import diffusers
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
 def main():
-    # Create model with desired hyperparameters
-    model = SimpleLightningModule(
+
+    # Load weights from checkpoint while keeping current hyperparameters
+    checkpoint_path = "lightning_logs/bit_wise/version_137/checkpoints/epoch=8696-step=139152.ckpt"
+    model = SimpleLightningModule.load_from_checkpoint(
+        checkpoint_path=checkpoint_path,
+        strict=False,
         learning_rate=0.0001,
         denoise_steps=100,
         batch_size=64,
@@ -24,11 +29,6 @@ def main():
         log_interval_seconds=60,
     )
     
-    # Load weights from checkpoint while keeping current hyperparameters
-    checkpoint_path = "lightning_logs/bit_wise/version_113/checkpoints/epoch=1775-step=28416.ckpt"  # Replace with your checkpoint path
-    state_dict = torch.load(checkpoint_path)["state_dict"]
-    # model.load_state_dict(state_dict, strict=True)
-
     trainer = L.Trainer(
         max_epochs=-1,
         accelerator="mps",
@@ -47,27 +47,20 @@ class SimpleLightningModule(L.LightningModule):
 
         self.last_sample_time = time.time()  # Initialize with current time
 
-    def create_model(self):
-        return nn.Sequential(
-            UNet(
-                spatial_dims=2,
-                in_channels=24,  # Input is 3 * 8 bits
-                out_channels=64,  # Output is 3 * 8 bits
-                channels=(64, 128, 256, 512),  # Feature channels at each layer
-                strides=(2, 2, 2),  # Downsampling factors
-                num_res_units=4,  # Number of residual units per layer
-            ),
-            nn.Conv2d(64, 24, kernel_size=1, stride=1, padding=0),
-            nn.Sigmoid(),
+    def create_model(self) -> diffusers.UNet2DModel:
+
+        return diffusers.UNet2DModel(
+            in_channels=3*self.hparams.num_bits,
+            out_channels=3*self.hparams.num_bits,
+            down_block_types = ("DownBlock2D", "DownBlock2D", "DownBlock2D", "DownBlock2D"),
+            up_block_types = ("UpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"),
+            block_out_channels = (64, 128, 256, 512),
+            layers_per_block = 1,
         )
 
-    def forward(self, x, mask):
-        x_tri = self.binary_to_ternery(x)
+    def forward(self, x, t):
 
-        # Maksed bits become zero so that the set of inputs values is {-1,0,1}
-        x_tri_masked = x_tri * mask
-
-        return self.model(x_tri_masked)
+        return F.sigmoid(self.model(x, timestep=t).sample)
 
     def training_step(self, batch, batch_idx):
         p = self.hparams
@@ -76,19 +69,36 @@ class SimpleLightningModule(L.LightningModule):
         x_bits = self.int_to_bits(x_int, p.num_bits)
 
         t = self.sample_t_for_each_sample_in_batch(x_bits.shape)
-        mask = self.sample_random_mask(t, x_bits.shape)
 
-        x_hat = self(x_bits, mask)
-        inv_mask = 1 - mask
+        noisy_x_bits = self.sample_random_x(x_bits, t)
 
-        # Only compute loss where the mask was 0
-        loss = self.loss_fn(inv_mask * x_hat, inv_mask * x_bits)
+        x_prob = self(noisy_x_bits, t)
+
+        loss = self.loss_fn(x_prob, x_bits)
 
         self.log('train_loss', loss)
 
         self.periodically_generate_and_log_samples()
         
         return loss
+
+            
+    def sample_random_x(self, x_prob: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+
+        # Make sure t has the same number of dimensions as shape
+        while t.dim() < len(x_prob.shape):
+            t = t.unsqueeze(-1)
+        
+        # t=0 blend_prob = x_prob
+        # t=1 blend_prob = 0.5 (fully random)
+        blend_prob = (1-t)*x_prob + t*0.5
+
+        # Make binary mask with probability t
+        # Each sample in the batchs gets its own mask
+        x = torch.rand_like(blend_prob) < blend_prob
+
+        return x.float()
+
     
     def periodically_generate_and_log_samples(self):
         p = self.hparams
@@ -122,17 +132,9 @@ class SimpleLightningModule(L.LightningModule):
                 t = torch.tensor([t],dtype=torch.float32)
                 t = t.repeat(num_samples).to(self.device)
 
-                # Sample a random mask for each sample in the batch
-                mask = self.sample_random_mask(t, x.shape)
+                x = self(x,t)
 
-                # Predict the probability of each bit being 1
-                x_prob = self(x, mask)
-
-                # Sample the bits from the probability distribution
-                x_sampled = (x_prob > torch.rand_like(x_prob)).float()
-
-                # Update the masked bits
-                x = mask * x + (1 - mask) * x_sampled
+                x = self.sample_random_x(x, t)
 
                 x_int = self.bits_to_int(x, p.num_bits)
                 x_steps.append(x_int[0])
@@ -150,20 +152,6 @@ class SimpleLightningModule(L.LightningModule):
     def sample_t_for_each_sample_in_batch(self, shape: torch.Size) -> torch.Tensor:
         t = torch.rand(shape[0], device=self.device)
         return t
-    
-    def sample_random_mask(self, t: torch.Tensor, shape: torch.Size) -> torch.Tensor:
-        if not t.shape[0] == shape[0]:
-            raise ValueError(f"Expected first dimension of t to be {shape[0]}, but got {t.shape[0]}")
-        
-        # Make sure t has the same number of dimensions as shape
-        while t.dim() < len(shape):
-            t = t.unsqueeze(-1)
-        
-        # Make binary mask with probability t
-        # Each sample in the batchs gets its own mask
-        mask = torch.rand(shape, device=self.device) > t
-
-        return mask.float()
 
 
     def train_dataloader(self):
