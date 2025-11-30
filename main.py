@@ -17,10 +17,11 @@ ssl._create_default_https_context = ssl._create_unverified_context
 def main():
 
     # Load weights from checkpoint while keeping current hyperparameters
-    checkpoint_path = "lightning_logs/bit_wise/version_137/checkpoints/epoch=8696-step=139152.ckpt"
+    checkpoint_path = "lightning_logs/bit_wise/version_168/checkpoints/epoch=2667-step=42688.ckpt"
     model = SimpleLightningModule.load_from_checkpoint(
         checkpoint_path=checkpoint_path,
         strict=False,
+    # model = SimpleLightningModule(
         learning_rate=0.0001,
         denoise_steps=100,
         batch_size=64,
@@ -65,6 +66,8 @@ class SimpleLightningModule(L.LightningModule):
     def training_step(self, batch, batch_idx):
         p = self.hparams
         x_int = batch[0]
+
+        # self.log_batch_of_samples('real', x_int)
     
         x_bits = self.int_to_bits(x_int, p.num_bits)
 
@@ -121,8 +124,8 @@ class SimpleLightningModule(L.LightningModule):
     def generate_bit_samples(self, num_samples, num_steps):
         print(f"Generating {num_samples} samples at epoch {self.current_epoch}")
         p = self.hparams
-        x = torch.zeros(num_samples, 3*p.num_bits, p.image_size, p.image_size, device=self.device)
-
+        x = torch.rand(num_samples, 3*p.num_bits, p.image_size, p.image_size, device=self.device)
+        x = (x > 0.5).float()
         x_steps = []
 
         with torch.no_grad():
@@ -187,8 +190,14 @@ class SimpleLightningModule(L.LightningModule):
     def transform(self, pil_image):
         p = self.hparams
         transform = torchvision.transforms.Compose([
-            torchvision.transforms.CenterCrop(min(pil_image.size)),
-            torchvision.transforms.Resize((p.image_size , p.image_size)),
+            # Take a random sized crop between 50-100% of the image
+            torchvision.transforms.RandomResizedCrop(
+                size=(p.image_size, p.image_size),
+                scale=(0.5, 1.0),
+                ratio=(0.75, 1.33)
+            ),
+            # Randomly flip the image horizontally with 50% probability
+            torchvision.transforms.RandomHorizontalFlip(p=0.5),
             torchvision.transforms.PILToTensor(),
         ])
         return transform(pil_image)
